@@ -54,7 +54,8 @@ def build_label_embedding(train_set,session,Bert_model,tokenizer,word_info, args
                     encoded_input = tokenizer(f'a photo of {cls}', return_tensors='pt')
                     output = Bert_model(**encoded_input)
                     # words_embed.append(bert_map(output.pooler_output))
-                    words_embed.append(output.pooler_output)
+                    #* -clip_vit: CLIP text embedding (512-d); otherwise BERT pooler output (768-d)
+                    words_embed.append(output.text_embeds if args.clip_vit else output.pooler_output)
                     word_info["label_text"] = np.append(word_info["label_text"], cls)
         elif args.dataset in ['cub200', 'air']:
             for cls in classes:
@@ -67,7 +68,7 @@ def build_label_embedding(train_set,session,Bert_model,tokenizer,word_info, args
                     encoded_input = tokenizer(f'a photo of {cls}', return_tensors='pt')
                     output = Bert_model(**encoded_input)
                     # words_embed.append(bert_map(output.pooler_output))
-                    words_embed.append(output.pooler_output)
+                    words_embed.append(output.text_embeds if args.clip_vit else output.pooler_output)
                     word_info["label_text"] = np.append(word_info["label_text"], f'a photo of {cls}')
         else:
             raise KeyError
@@ -168,7 +169,8 @@ def base_train(model, trainloader, optimizer, scheduler, epoch, word_info, query
             loss_tri = torch.zeros(1,device='cuda')
         
         if args.SKD:
-            loss_kb = knowledge_boosting(prompt_embed['Language'], word_embed, query_info, train_label,loss_curve)
+            loss_kb = knowledge_boosting(prompt_embed['Language'], word_embed, query_info, train_label,loss_curve,
+                                         lang_kd=prompt_embed.get('Language_txt'))
             # loss_kb = knowledge_boosting(prompt_embed['Language'], word_embed, word_cur_embed, train_label)
         else:
             loss_kb = torch.zeros(1,device='cuda')
@@ -223,17 +225,18 @@ def triplet(cls_embed, vision_embed, query_info, train_label,loss_curve):
     loss_tri = ((l_ent/l_kl)+1).log()
     return loss_tri
 
-def knowledge_boosting(lang_embed, word_embed, query_info, train_label, loss_curve):
+def knowledge_boosting(lang_embed, word_embed, query_info, train_label, loss_curve, lang_kd=None):
     T = 2.
     idx= torch.arange(len(train_label))
     #* Original
     P_head = query_info['proto'].clone().cuda()
-    
+
     #* =======================================================================
     lang_logit = F.linear(lang_embed, P_head)    #* Soft pred
     loss_seman = F.cross_entropy(lang_logit, train_label)
-    #* KL Feature
-    loss_kd = F.kl_div(F.log_softmax(lang_embed/T,dim=1), F.softmax(word_embed[train_label]/T,dim=1), reduction='batchmean')
+    #* KL Feature (-clip_vit: the Language token projected into CLIP's 512-d text space)
+    lang_kd = lang_embed if lang_kd is None else lang_kd
+    loss_kd = F.kl_div(F.log_softmax(lang_kd/T,dim=1), F.softmax(word_embed[train_label]/T,dim=1), reduction='batchmean')
     
     loss = loss_kd + 0.2*loss_seman
     return 0.1*loss

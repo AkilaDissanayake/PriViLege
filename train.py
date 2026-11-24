@@ -87,6 +87,8 @@ def get_command_line_parser():
     
     parser.add_argument('-prefix', action='store_true')
     parser.add_argument('-pret_clip', action='store_true')
+    parser.add_argument('-clip_vit', action='store_true',
+                        help='PriViLege-CLIP: OpenAI CLIP ViT-B/16 image encoder as the backbone and the CLIP text encoder in place of BERT')
     parser.add_argument('-comp_out', type=int, default=1.)
     
     # parser.add_argument('-scratch', action='store_true')

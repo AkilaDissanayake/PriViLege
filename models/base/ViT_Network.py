@@ -15,6 +15,46 @@ from models.vision_transformer import VisionTransformer
 #todo Need Something to focus on domain specific knowledge learning 
 #todo finc inciteness from the Novel Category Discovery 
 # import open_clip as clip
+
+#* ---------------------------------------------------------------------------------------
+#* PriViLege-CLIP (-clip_vit): OpenAI CLIP ViT-B/16 image encoder, built as a timm
+#* VisionTransformer so that prompt_encode / _pk_tuning work on it unchanged.
+#* ---------------------------------------------------------------------------------------
+CLIP_HF_REPO = 'timm/vit_base_patch16_clip_224.openai'   # OpenAI weights in open_clip format
+CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
+CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
+#* Normalisation the dataloaders already apply (with -vit), so it can be swapped for CLIP's
+DATASET_NORM = {
+    'cifar100': ((0.507, 0.487, 0.441), (0.267, 0.256, 0.276)),
+    'cub200': ((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+    'mini_imagenet': ((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+}
+
+
+class QuickGELU(nn.Module):
+    #* The activation OpenAI CLIP was trained with
+    def forward(self, x):
+        return x * torch.sigmoid(1.702 * x)
+
+
+def build_clip_vit():
+    """OpenAI CLIP ViT-B/16 image tower as a timm VisionTransformer.
+
+    pre_norm=True adds CLIP's ln_pre (as encoder.norm_pre). num_classes=512 keeps CLIP's
+    image projection (visual.proj) as encoder.head, which maps 768-d tokens into the
+    512-d space shared with the CLIP text encoder.
+    """
+    from huggingface_hub import hf_hub_download
+    from safetensors.torch import load_file
+    from timm.models.vision_transformer import VisionTransformer as TimmViT, _convert_openai_clip
+
+    model = TimmViT(img_size=224, patch_size=16, embed_dim=768, depth=12, num_heads=12,
+                    pre_norm=True, norm_layer=nn.LayerNorm, act_layer=QuickGELU, num_classes=512)
+    state = load_file(hf_hub_download(CLIP_HF_REPO, 'open_clip_model.safetensors'))
+    model.load_state_dict(_convert_openai_clip(state, model))   # strict: every weight must match
+    return model
+
+
 class ViT_MYNET(nn.Module):
 
     def __init__(self, args, mode=None):
@@ -30,7 +70,15 @@ class ViT_MYNET(nn.Module):
         if self.args.dataset == 'cub200' or self.args.dataset == 'air':
             self.num_features = 768
 
-        if args.scratch:
+        if args.clip_vit:
+            self.encoder = build_clip_vit()
+            #* Undo the dataset normalisation and apply CLIP's (done inside the model)
+            ds_mean, ds_std = DATASET_NORM[args.dataset]
+            self.register_buffer('ds_mean', torch.tensor(ds_mean).view(1, 3, 1, 1), persistent=False)
+            self.register_buffer('ds_std', torch.tensor(ds_std).view(1, 3, 1, 1), persistent=False)
+            self.register_buffer('clip_mean', torch.tensor(CLIP_MEAN).view(1, 3, 1, 1), persistent=False)
+            self.register_buffer('clip_std', torch.tensor(CLIP_STD).view(1, 3, 1, 1), persistent=False)
+        elif args.scratch:
             self.encoder = timm.create_model("vit_base_patch16_224",pretrained=False,num_classes=args.num_classes,
                                 drop_rate=0.,drop_path_rate=0.,drop_block_rate=None)
         else:
@@ -77,11 +125,18 @@ class ViT_MYNET(nn.Module):
         
         return logit
     
+    def _clip_input(self, img):
+        #* -clip_vit only: dataset normalisation -> CLIP normalisation
+        if not self.args.clip_vit:
+            return img
+        return (img * self.ds_std + self.ds_mean - self.clip_mean) / self.clip_std
+
     def encode(self, x):
-        x = self.encoder.forward_features(x)[:,0]
+        x = self.encoder.forward_features(self._clip_input(x))[:,0]
         return x
-    
+
     def prompt_encode(self, img, prompt_feat=False, B_tuning=False, eval=False):
+        img = self._clip_input(img)
         x = self.encoder.patch_embed(img)
         ex_cls = self.encoder.cls_token.expand(x.shape[0], -1, -1)
         x = torch.cat([ex_cls,x],dim=1)
@@ -92,6 +147,8 @@ class ViT_MYNET(nn.Module):
         pos_tkn = prompting_tkn + self.encoder.pos_embed[:,0].expand(self.prompt_length, -1)
         pos_tkn = pos_tkn.expand(x.shape[0],-1,-1)
         x = torch.cat([x[:,0].unsqueeze(1), pos_tkn, x[:,1:]],dim=1)#
+        #* CLIP's ln_pre (nn.Identity for the default ViT, so no change there)
+        x = self.encoder.norm_pre(x)
         #!=============================================================
         #* prefix for B-Prompt (Original)
         if B_tuning:
@@ -105,7 +162,11 @@ class ViT_MYNET(nn.Module):
             #todo Align -> Head
             prompt_embed['Vision'] = x[:,1]
             prompt_embed['Language'] = x[:,2]
-            
+            if self.args.clip_vit:
+                #* CLIP's frozen image projection: 768-d Language token -> 512-d text space,
+                #* so L_KD can compare it with the CLIP text embedding of the class name
+                prompt_embed['Language_txt'] = self.encoder.head(x[:,2])
+
             return cls_embed, prompt_embed
         else:
             return cls_embed
@@ -250,7 +311,8 @@ class ViT_MYNET(nn.Module):
                 
                 loss_ce = F.cross_entropy(logits, data_label)
                 if self.args.SKD:
-                    loss_kb = self.knowledge_boosting(prompt_feat["Language"], word_embed, query_info, data_label)
+                    loss_kb = self.knowledge_boosting(prompt_feat["Language"], word_embed, query_info, data_label,
+                                                      lang_kd=prompt_feat.get("Language_txt"))
                     loss = loss_ce + loss_kb
                 else:
                     loss = loss_ce
@@ -286,13 +348,15 @@ class ViT_MYNET(nn.Module):
         fc_feat_sim = (1. - torch.cosine_similarity(fc_wts[label], head_feat, dim=1)).mean()
         return fc_feat_sim
 
-    def knowledge_boosting(self, lang_embed, word_embed, query_info, label):
+    def knowledge_boosting(self, lang_embed, word_embed, query_info, label, lang_kd=None):
         P_head = query_info['proto'].clone().cuda()
         T = 2.
         lang_logit = F.linear(lang_embed, P_head)
         loss_seman = F.cross_entropy(lang_logit, label)
-        
-        loss_kd = F.kl_div(F.log_softmax(lang_embed/T,dim=1), F.softmax(word_embed[label]/T,dim=1), reduction='batchmean')
+
+        #* -clip_vit: distil the projected (512-d) Language token; otherwise the 768-d one
+        lang_kd = lang_embed if lang_kd is None else lang_kd
+        loss_kd = F.kl_div(F.log_softmax(lang_kd/T,dim=1), F.softmax(word_embed[label]/T,dim=1), reduction='batchmean')
         loss = loss_kd + 0.2*loss_seman
         # return 0.5*loss
         return 0.1*loss

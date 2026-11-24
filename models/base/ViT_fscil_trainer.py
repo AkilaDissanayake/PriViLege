@@ -112,8 +112,15 @@ class ViT_FSCILTrainer(Trainer):
         self.loss_curve['attn_score']=[]
         
         #* Bert_model for ViT-B
-        self.tokenizer = BertTokenizer.from_pretrained('bert-base-cased')
-        self.Bert_model = BertModel.from_pretrained("bert-base-cased")
+        if self.args.clip_vit:
+            #* PriViLege-CLIP: the CLIP text encoder (with its projection) replaces BERT.
+            #* Same OpenAI ViT-B/16 CLIP as the image encoder; outputs 512-d text_embeds.
+            from transformers import CLIPTokenizer, CLIPTextModelWithProjection
+            self.tokenizer = CLIPTokenizer.from_pretrained('openai/clip-vit-base-patch16')
+            self.Bert_model = CLIPTextModelWithProjection.from_pretrained('openai/clip-vit-base-patch16')
+        else:
+            self.tokenizer = BertTokenizer.from_pretrained('bert-base-cased')
+            self.Bert_model = BertModel.from_pretrained("bert-base-cased")
         self.Bert_model = nn.DataParallel(self.Bert_model, list(range(self.args.num_gpu)))
         self.Bert_model = self.Bert_model.cuda()
         
@@ -384,7 +391,7 @@ class ViT_FSCILTrainer(Trainer):
     #* ------------------------------------------------------------------
     RESUME_ARGS = ['dataset', 'seed', 'epochs_base', 'epochs_new', 'lr_base', 'lr_new', 'batch_size_base',
                    'schedule', 'base_mode', 'new_mode', 'ED', 'ED_hp', 'SKD', 'LT', 'taskblock', 'comp_out',
-                   'prefix', 'vit', 'pret_clip']
+                   'prefix', 'vit', 'pret_clip', 'clip_vit']
 
     def _resume_enabled(self):
         return bool(getattr(self.args, 'ckpt_dir', None))
@@ -439,6 +446,7 @@ class ViT_FSCILTrainer(Trainer):
             state = torch.load(path, map_location='cpu', weights_only=False)
         except TypeError:  # torch < 1.13 has no weights_only
             state = torch.load(path, map_location='cpu')
+        state['fingerprint'].setdefault('clip_vit', False)   # states saved before -clip_vit existed
         if state['fingerprint'] != self._resume_fingerprint():
             raise ValueError('Resume state in {} was saved with different arguments.\nsaved: {}\nnow:   {}\n'
                              'Delete that folder or use another -ckpt_dir.'.format(
